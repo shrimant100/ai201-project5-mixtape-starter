@@ -246,6 +246,169 @@ tests/test_streaks.py::test_streak_increments_on_sunday PASSED
 
 ---
 
+## Issue #2 — Friends Listening Now shows people from yesterday
+
+**Affected service:** `services/feed_service.py`  
+**Reported by:** nova
+
+### How I Reproduced It
+
+#### Trigger conditions
+
+This bug appears on **morning-after** scenarios when all of the following are true:
+
+- The viewing user has at least one friend with a recent `ListeningEvent`.
+- The friend's most recent listen was **last night** (previous calendar day).
+- The viewer checks the feed **this morning**, within 24 hours of that listen (e.g. 11 PM yesterday → 9 AM today = 10 hours ago).
+
+The bug does **not** appear if the friend listened earlier than 24 hours ago, or if the friend listened today. It is most visible when the listen crosses a **calendar-day boundary** but still falls inside the rolling 24-hour window.
+
+#### Data state required
+
+- A viewing user (nova) with at least one friend (darius).
+- A `ListeningEvent` for the friend with `listened_at` set to the previous evening (e.g. Sunday 11:00 PM UTC).
+- Current time simulated or actual as the following morning (e.g. Monday 9:00 AM UTC).
+
+Seed data sets up nova ↔ darius as friends and includes recent listening events, but those events are only minutes old — so to reproduce the morning-after case, the friend's `listened_at` must be set to yesterday evening.
+
+#### Steps to reproduce
+
+**Method A — via service layer with controlled time (works any day):**
+
+1. Create a viewer and friend with a bidirectional friendship.
+2. Insert a `ListeningEvent` for the friend at yesterday 11:00 PM UTC.
+3. Patch `datetime.now()` to return today 9:00 AM UTC.
+4. Call `get_friends_listening_now(viewer_id)`.
+5. Inspect the returned feed count and `listened_at` dates.
+
+**Method B — via API endpoints:**
+
+1. Start the app: `$env:FLASK_APP = "app:create_app"; flask run`
+2. Update darius's most recent `ListeningEvent` `listened_at` to yesterday evening (or wait until morning after a late-night listen).
+3. `GET /feed/<nova_id>/listening-now`
+4. Check whether darius appears despite not having listened today.
+
+#### Inputs used
+
+| Input | Value |
+|-------|-------|
+| Viewer | nova (`369e7205-133b-4102-bcdd-8c26d9c50731`) |
+| Friend | darius (`6539e12c-cfde-4574-981b-0064548d47d5`) |
+| Friend `listened_at` | 2024-06-16 23:00 UTC (previous day) |
+| Viewer checks feed at | 2024-06-17 09:00 UTC (next morning) |
+| Hours since listen | 10 |
+| `RECENT_THRESHOLD` | `timedelta(hours=24)` |
+
+#### Sequence of actions
+
+1. Friend darius listens to a song at 11:00 PM Sunday night → `ListeningEvent` created.
+2. Viewer nova opens "Friends Listening Now" at 9:00 AM Monday morning.
+3. `get_friends_listening_now` computes `cutoff = now - 24 hours` (Monday 9 AM − 24h = Sunday 9 AM).
+4. Darius's event at Sunday 11 PM is **after** the cutoff → included in feed.
+5. Feed shows darius as "listening now" even though his last listen was **yesterday**, not today.
+
+#### Expected vs actual
+
+| | Value |
+|---|-------|
+| **Expected** | Feed is empty (or excludes darius) — only friends who listened **today** should appear |
+| **Actual** | Feed contains 1 entry for darius with `listened_at` from yesterday |
+
+#### Reproduction output
+
+```
+friend_listened_at=2024-06-16 23:00:00+00:00 (2024-06-16)
+viewer_checks_at=2024-06-17 09:00:00+00:00 (2024-06-17)
+hours_since_listen=10.0
+24h_cutoff=2024-06-16 09:00:00+00:00
+within_24h_window=True
+same_calendar_day=False
+feed_count=1
+friend_in_feed=friend2
+listened_at=2024-06-16T23:00:00
+expected_count=0 (friend listened yesterday, not today)
+```
+
+#### Root cause
+
+**Confirmed: the rolling 24-hour cutoff is the primary driver.**
+
+In `get_friends_listening_now`, line 32 computes:
+
+```python
+cutoff = datetime.now(timezone.utc) - RECENT_THRESHOLD  # RECENT_THRESHOLD = timedelta(hours=24)
+```
+
+The filter `ListeningEvent.listened_at >= cutoff` includes any event from the past 24 hours **regardless of calendar day**. That is why a friend who listened at 11 PM yesterday still appears at 9 AM today — only 10 hours have passed, so the event clears the cutoff even though it is not from "today."
+
+Our reproduction proved this directly:
+
+| Check | Result |
+|-------|--------|
+| `within_24h_window` | `True` → friend incorrectly included |
+| `same_calendar_day` (UTC) | `False` → should have been excluded |
+
+**Timezone is a secondary factor, not the root bug.**
+
+The entire app stores and compares timestamps in **UTC** (`datetime.now(timezone.utc)` in `feed_service.py`, `streak_service.py`, and `seed_data.py`). There is no user timezone field or local-time conversion anywhere. That means:
+
+- Users perceive "today" in their **local** timezone.
+- The feed evaluates recency in **UTC**.
+
+Example — same wall-clock scenario in US Pacific (11 PM Sunday → 9 AM Monday local):
+
+```
+friend_listened_utc=2024-06-17 06:00:00+00:00   # Monday in UTC
+viewer_checks_utc=2024-06-17 16:00:00+00:00     # also Monday in UTC
+local_same_calendar_day=False                    # Sunday vs Monday locally
+utc_same_calendar_day=True                       # both Monday in UTC
+rolling_24h_includes=True                        # still included (10 hours ago)
+```
+
+So UTC/local misalignment can make "listening now" feel wrong to users even beyond this bug — but for Issue #2 specifically, the **incorrect filter type** (rolling 24-hour window instead of calendar-day boundary) is what the code is doing wrong. The intended behavior ("only friends who listened today") matches how `streak_service.py` already handles dates: compare `listened_at.date()` against `now.date()` in UTC.
+
+**Fix direction:** Replace the rolling cutoff with a UTC calendar-day filter, consistent with streak logic.
+
+#### Fix
+
+Replace the rolling 24-hour cutoff with a UTC calendar-day window:
+
+```python
+# Before (buggy)
+cutoff = datetime.now(timezone.utc) - RECENT_THRESHOLD
+ListeningEvent.listened_at >= cutoff
+
+# After (fixed)
+now = datetime.now(timezone.utc)
+start_of_today = datetime(now.year, now.month, now.day, tzinfo=timezone.utc)
+start_of_tomorrow = start_of_today + timedelta(days=1)
+ListeningEvent.listened_at >= start_of_today,
+ListeningEvent.listened_at < start_of_tomorrow,
+```
+
+Also removed the unused `RECENT_THRESHOLD` constant.
+
+**File changed:** `services/feed_service.py`, lines 13 and 29–42.
+
+#### Post-fix verification
+
+```bash
+pytest tests/test_feed.py tests/test_streaks.py tests/test_search.py -v
+```
+
+```
+tests/test_feed.py::test_excludes_friend_who_listened_yesterday_within_24h PASSED
+tests/test_feed.py::test_includes_friend_who_listened_today PASSED
+tests/test_streaks.py (5 tests) PASSED
+tests/test_search.py (5 tests) PASSED
+
+12 passed in 1.07s
+```
+
+Note: `tests/test_playlists.py` still fails — that is the separate Issue #5 bug, not yet fixed.
+
+---
+
 ## AI Tool Disclosure
 
 AI was used during codebase orientation to summarize service files, trace data flows, and draft this codebase map. All bug fixes will be implemented and verified manually.
