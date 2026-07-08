@@ -118,294 +118,157 @@ Stretch goals if time allows: **#4** (missing rating notification — architectu
 
 ---
 
-## Issue #1 — Listening streak resets on Sundays
+## Root Cause Analysis
 
-**Affected service:** `services/streak_service.py`  
-**Reported by:** kenji
+Each entry below follows the required five-field format: **(1)** issue number and title, **(2)** how you reproduced it, **(3)** how you found the root cause, **(4)** the root cause, **(5)** your fix and side-effect check.
 
-### How I Reproduced It
+### Issue #1
 
-#### Trigger conditions
+#### 1. Issue number and title
 
-This bug is **Sunday-only**. It fires when all of the following are true:
+**Issue #1 — Listening streak resets on Sundays**  
+**Affected service:** `services/streak_service.py` · **Reported by:** kenji
 
-- The user has an active streak (`listening_streak` > 1).
-- The user's `last_listened_at` date is **yesterday** (`days_since_last == 1`).
-- **Today is Sunday** (`datetime.weekday() == 6`).
+#### 2. How you reproduced it
 
-On any other weekday, consecutive-day listening increments the streak normally. The bug does not appear if a day was skipped (`days_since_last > 1`) or if the user already listened today (`days_since_last == 0`).
+Set a user to `listening_streak = 12` with `last_listened_at` on Saturday (`2024-06-15 20:00 UTC`), then called `update_listening_streak` with a Sunday timestamp (`2024-06-16 09:00 UTC`). Also ran `pytest tests/test_streaks.py::test_streak_increments_on_sunday`, which failed before the fix.
 
-#### Data state required
-
-- A user with `listening_streak = 12` and `last_listened_at` set to the previous calendar day (Saturday evening).
-- A valid `song_id` to record a listen event against.
-
-Seed data includes **kenji** with `listening_streak = 12`, but kenji's `last_listened_at` is set to "today" in the seed — so to hit the Saturday → Sunday path, the user's `last_listened_at` must be adjusted to yesterday before listening on a Sunday.
-
-#### Steps to reproduce
-
-**Method A — via pytest (controlled dates, works any day):**
-
-```bash
-pytest tests/test_streaks.py::test_streak_increments_on_sunday -v
-```
-
-**Method B — via service layer (controlled dates, works any day):**
-
-1. Create a user with `listening_streak = 12` and `last_listened_at = 2024-06-15` (Saturday).
-2. Call `update_listening_streak(user, sunday_datetime)` where `sunday_datetime` is `2024-06-16` (Sunday).
-3. Read `user.listening_streak`.
-
-**Method C — via API endpoints (requires running on an actual Sunday):**
-
-1. Start the app: `$env:FLASK_APP = "app:create_app"; flask run`
-2. Set kenji's `last_listened_at` to Saturday (direct DB update or listen on Saturday).
-3. `POST /songs/<song_id>/listen` with body `{ "user_id": "<kenji_id>" }` on Sunday morning.
-4. `GET /users/<kenji_id>/streak`
-
-#### Inputs used
-
-
-| Input              | Value                                                                      |
-| ------------------ | -------------------------------------------------------------------------- |
-| User               | kenji (`1149a09f-b5af-46d0-8d5b-b79472dca53c`) or test user with streak 12 |
-| `last_listened_at` | Saturday 2024-06-15 20:00 UTC                                              |
-| Listen timestamp   | Sunday 2024-06-16 09:00 UTC                                                |
-| `days_since_last`  | 1                                                                          |
-| `today.weekday()`  | 6 (Sunday)                                                                 |
-
-
-#### Sequence of actions
-
-1. User listens daily through Saturday → streak reaches 12, `last_listened_at` = Saturday.
-2. User listens again Sunday morning → `record_listening_event` calls `update_listening_streak`.
-3. Streak logic sees `days_since_last == 1` but also checks `today.weekday() != 6`, which fails on Sunday.
-4. Control falls through to the `else` branch, resetting streak to 1.
-
-#### Expected vs actual
-
-
-|              | Value                          |
-| ------------ | ------------------------------ |
-| **Expected** | Streak increments from 12 → 13 |
-| **Actual**   | Streak resets to 1             |
-
-
-#### Reproduction output
+| | Value |
+|---|-------|
+| `days_since_last` | 1 (listened yesterday) |
+| `today.weekday()` | 6 (Sunday) |
+| **Expected** | Streak increments 12 → 13 |
+| **Actual** | Streak resets to 1 |
 
 ```
 BEFORE Sunday listen: streak=12, last_listened=2024-06-15
 AFTER Sunday listen:  streak=1 (expected 13)
-days_since_last=1, today.weekday()=6
 ```
 
-Pytest failure confirming the same behavior:
+This is **Sunday-only** — the bug does not fire on other weekdays or when a day was skipped.
 
-```
-tests/test_streaks.py::test_streak_increments_on_sunday FAILED
-assert 1 == 2   # streak stays 1 instead of incrementing to 2
-```
+#### 3. How you found the root cause
 
-#### Root cause
+Traced the call chain from the issue report: `POST /songs/<id>/listen` → `routes/songs.py` → `streak_service.record_listening_event()` → `update_listening_streak()`. Opened `services/streak_service.py` and read the streak-update conditional on line 73. Noticed the increment branch required **both** `days_since_last == 1` **and** `today.weekday() != 6` — the second check only passes when today is not Sunday.
 
-In `update_listening_streak`, line 73 checks `days_since_last == 1 and today.weekday() != 6`. The `weekday() != 6` guard incorrectly excludes Sunday from consecutive-day increment, sending Sunday listeners to the reset branch on line 76.
+#### 4. The root cause
 
-**Confirmed:** Yes — `today.weekday() != 6` is the culprit. On Sunday, `days_since_last == 1` is true but the combined condition is false, so the `else` branch runs and resets the streak to 1. No other code path is involved.
+Python's `datetime.weekday()` returns `6` for Sunday. The increment branch on line 73 required `days_since_last == 1 and today.weekday() != 6`, meaning consecutive-day streak updates were explicitly blocked on Sundays. When a user listened on Saturday and again on Sunday, `days_since_last` was correctly `1`, but the `weekday() != 6` check evaluated to `False`, so control fell through to the `else` on line 76 which reset `listening_streak` to `1`. The code treated a valid consecutive-day Sunday listen as a broken streak.
 
-#### Fix
+#### 5. Your fix and side-effect check
 
-Remove the erroneous Sunday exclusion so consecutive-day logic applies uniformly:
+Removed the erroneous `today.weekday() != 6` guard so consecutive-day logic applies on all days:
 
 ```python
-# Before (buggy)
+# Before
 elif days_since_last == 1 and today.weekday() != 6:
-    user.listening_streak += 1
 
-# After (fixed)
+# After
 elif days_since_last == 1:
-    user.listening_streak += 1
 ```
 
-**File changed:** `services/streak_service.py`, line 73.
-
-#### Post-fix verification
-
-```bash
-pytest tests/test_streaks.py -v
-```
-
-```
-tests/test_streaks.py::test_streak_starts_at_1_for_new_user PASSED
-tests/test_streaks.py::test_streak_increments_on_consecutive_day PASSED
-tests/test_streaks.py::test_streak_does_not_double_count_same_day PASSED
-tests/test_streaks.py::test_streak_resets_after_skipped_day PASSED
-tests/test_streaks.py::test_streak_increments_on_sunday PASSED
-
-5 passed in 0.86s
-```
+**Side-effect check:** Ran `pytest tests/test_streaks.py -v` — all 5 tests pass, including consecutive-day increment, same-day no double-count, skipped-day reset, and Sunday increment. No other files changed.
 
 ---
 
-## Issue #2 — Friends Listening Now shows people from yesterday
+### Issue #2
 
-**Affected service:** `services/feed_service.py`  
-**Reported by:** nova
+#### 1. Issue number and title
 
-### How I Reproduced It
+**Issue #2 — Friends Listening Now shows people from yesterday**  
+**Affected service:** `services/feed_service.py` · **Reported by:** nova
 
-#### Trigger conditions
+#### 2. How you reproduced it
 
-This bug appears on **morning-after** scenarios when all of the following are true:
-
-- The viewing user has at least one friend with a recent `ListeningEvent`.
-- The friend's most recent listen was **last night** (previous calendar day).
-- The viewer checks the feed **this morning**, within 24 hours of that listen (e.g. 11 PM yesterday → 9 AM today = 10 hours ago).
-
-The bug does **not** appear if the friend listened earlier than 24 hours ago, or if the friend listened today. It is most visible when the listen crosses a **calendar-day boundary** but still falls inside the rolling 24-hour window.
-
-#### Data state required
-
-- A viewing user (nova) with at least one friend (darius).
-- A `ListeningEvent` for the friend with `listened_at` set to the previous evening (e.g. Sunday 11:00 PM UTC).
-- Current time simulated or actual as the following morning (e.g. Monday 9:00 AM UTC).
-
-Seed data sets up nova ↔ darius as friends and includes recent listening events, but those events are only minutes old — so to reproduce the morning-after case, the friend's `listened_at` must be set to yesterday evening.
-
-#### Steps to reproduce
-
-**Method A — via service layer with controlled time (works any day):**
-
-1. Create a viewer and friend with a bidirectional friendship.
-2. Insert a `ListeningEvent` for the friend at yesterday 11:00 PM UTC.
-3. Patch `datetime.now()` to return today 9:00 AM UTC.
-4. Call `get_friends_listening_now(viewer_id)`.
-5. Inspect the returned feed count and `listened_at` dates.
-
-**Method B — via API endpoints:**
-
-1. Start the app: `$env:FLASK_APP = "app:create_app"; flask run`
-2. Update darius's most recent `ListeningEvent` `listened_at` to yesterday evening (or wait until morning after a late-night listen).
-3. `GET /feed/<nova_id>/listening-now`
-4. Check whether darius appears despite not having listened today.
-
-#### Inputs used
-
-| Input | Value |
-|-------|-------|
-| Viewer | nova (`369e7205-133b-4102-bcdd-8c26d9c50731`) |
-| Friend | darius (`6539e12c-cfde-4574-981b-0064548d47d5`) |
-| Friend `listened_at` | 2024-06-16 23:00 UTC (previous day) |
-| Viewer checks feed at | 2024-06-17 09:00 UTC (next morning) |
-| Hours since listen | 10 |
-| `RECENT_THRESHOLD` | `timedelta(hours=24)` |
-
-#### Sequence of actions
-
-1. Friend darius listens to a song at 11:00 PM Sunday night → `ListeningEvent` created.
-2. Viewer nova opens "Friends Listening Now" at 9:00 AM Monday morning.
-3. `get_friends_listening_now` computes `cutoff = now - 24 hours` (Monday 9 AM − 24h = Sunday 9 AM).
-4. Darius's event at Sunday 11 PM is **after** the cutoff → included in feed.
-5. Feed shows darius as "listening now" even though his last listen was **yesterday**, not today.
-
-#### Expected vs actual
+Created nova (viewer) and darius (friend) with a `ListeningEvent` at Sunday 11:00 PM UTC, then called `get_friends_listening_now` with `datetime.now()` patched to Monday 9:00 AM UTC — only 10 hours later, but a different calendar day.
 
 | | Value |
 |---|-------|
-| **Expected** | Feed is empty (or excludes darius) — only friends who listened **today** should appear |
-| **Actual** | Feed contains 1 entry for darius with `listened_at` from yesterday |
-
-#### Reproduction output
+| Friend `listened_at` | 2024-06-16 23:00 UTC (yesterday) |
+| Viewer checks at | 2024-06-17 09:00 UTC (today) |
+| **Expected** | Feed empty — friend did not listen today |
+| **Actual** | Feed contains darius |
 
 ```
-friend_listened_at=2024-06-16 23:00:00+00:00 (2024-06-16)
-viewer_checks_at=2024-06-17 09:00:00+00:00 (2024-06-17)
-hours_since_listen=10.0
-24h_cutoff=2024-06-16 09:00:00+00:00
 within_24h_window=True
 same_calendar_day=False
-feed_count=1
-friend_in_feed=friend2
-listened_at=2024-06-16T23:00:00
-expected_count=0 (friend listened yesterday, not today)
+feed_count=1 (expected 0)
 ```
 
-#### Root cause
+#### 3. How you found the root cause
 
-**Confirmed: the rolling 24-hour cutoff is the primary driver.**
+Traced `GET /feed/<user_id>/listening-now` → `routes/feed.py` → `feed_service.get_friends_listening_now()`. On line 32, saw `cutoff = datetime.now(timezone.utc) - RECENT_THRESHOLD` using a rolling 24-hour window. Compared this to `streak_service.py`, which uses calendar-day boundaries via `now.date()`. The reproduction showed the friend's event passed the 24-hour cutoff (`within_24h_window=True`) but failed the calendar-day test (`same_calendar_day=False`).
 
-In `get_friends_listening_now`, line 32 computes:
+#### 4. The root cause
+
+`get_friends_listening_now` filtered events with `listened_at >= (now - timedelta(hours=24))`, a rolling 24-hour window. A friend who listened at 11 PM yesterday is still within that window at 9 AM today (10 hours elapsed), so the event passed the filter even though it occurred on a **previous calendar day**. The feed was meant to show friends who listened **today**, but the code measured elapsed hours instead of calendar-day membership — the wrong comparison type entirely.
+
+#### 5. Your fix and side-effect check
+
+Replaced the rolling cutoff with a UTC calendar-day window, consistent with `streak_service.py`:
 
 ```python
-cutoff = datetime.now(timezone.utc) - RECENT_THRESHOLD  # RECENT_THRESHOLD = timedelta(hours=24)
-```
-
-The filter `ListeningEvent.listened_at >= cutoff` includes any event from the past 24 hours **regardless of calendar day**. That is why a friend who listened at 11 PM yesterday still appears at 9 AM today — only 10 hours have passed, so the event clears the cutoff even though it is not from "today."
-
-Our reproduction proved this directly:
-
-| Check | Result |
-|-------|--------|
-| `within_24h_window` | `True` → friend incorrectly included |
-| `same_calendar_day` (UTC) | `False` → should have been excluded |
-
-**Timezone is a secondary factor, not the root bug.**
-
-The entire app stores and compares timestamps in **UTC** (`datetime.now(timezone.utc)` in `feed_service.py`, `streak_service.py`, and `seed_data.py`). There is no user timezone field or local-time conversion anywhere. That means:
-
-- Users perceive "today" in their **local** timezone.
-- The feed evaluates recency in **UTC**.
-
-Example — same wall-clock scenario in US Pacific (11 PM Sunday → 9 AM Monday local):
-
-```
-friend_listened_utc=2024-06-17 06:00:00+00:00   # Monday in UTC
-viewer_checks_utc=2024-06-17 16:00:00+00:00     # also Monday in UTC
-local_same_calendar_day=False                    # Sunday vs Monday locally
-utc_same_calendar_day=True                       # both Monday in UTC
-rolling_24h_includes=True                        # still included (10 hours ago)
-```
-
-So UTC/local misalignment can make "listening now" feel wrong to users even beyond this bug — but for Issue #2 specifically, the **incorrect filter type** (rolling 24-hour window instead of calendar-day boundary) is what the code is doing wrong. The intended behavior ("only friends who listened today") matches how `streak_service.py` already handles dates: compare `listened_at.date()` against `now.date()` in UTC.
-
-**Fix direction:** Replace the rolling cutoff with a UTC calendar-day filter, consistent with streak logic.
-
-#### Fix
-
-Replace the rolling 24-hour cutoff with a UTC calendar-day window:
-
-```python
-# Before (buggy)
+# Before
 cutoff = datetime.now(timezone.utc) - RECENT_THRESHOLD
 ListeningEvent.listened_at >= cutoff
 
-# After (fixed)
-now = datetime.now(timezone.utc)
+# After
 start_of_today = datetime(now.year, now.month, now.day, tzinfo=timezone.utc)
 start_of_tomorrow = start_of_today + timedelta(days=1)
 ListeningEvent.listened_at >= start_of_today,
 ListeningEvent.listened_at < start_of_tomorrow,
 ```
 
-Also removed the unused `RECENT_THRESHOLD` constant.
+Removed the unused `RECENT_THRESHOLD` constant. Added `tests/test_feed.py` with morning-after and same-day cases.
 
-**File changed:** `services/feed_service.py`, lines 13 and 29–42.
+**Side-effect check:** `pytest tests/test_feed.py tests/test_streaks.py tests/test_search.py -v` — 12 passed. `get_activity_feed()` was not modified (it intentionally returns all recent events regardless of day). `tests/test_playlists.py` still fails — separate Issue #5, unrelated.
 
-#### Post-fix verification
+---
 
-```bash
-pytest tests/test_feed.py tests/test_streaks.py tests/test_search.py -v
+### Issue #3
+
+#### 1. Issue number and title
+
+**Issue #3 — The same song keeps showing up twice in search**  
+**Affected service:** `services/search_service.py` · **Reported by:** simone
+
+#### 2. How you reproduced it
+
+Searched for `"Anthem"` against `"Crown Heights Anthem"` (3 tags: `rap`, `hip-hop`, `boom bap`) and compared join row counts across songs with 0, 1, and 3 tags. Also ran `pytest tests/test_search.py::test_search_no_duplicates_multi_tag_song`.
+
+| Song | Tags | SQL rows returned |
+|------|------|-------------------|
+| Plain Song | 0 | 1 |
+| One Tag Song | 1 | 1 |
+| Crown Heights Anthem | 3 | **3** |
+
+```
+buggy_titles ['Crown Heights Anthem', 'Crown Heights Anthem', 'Crown Heights Anthem']
 ```
 
-```
-tests/test_feed.py::test_excludes_friend_who_listened_yesterday_within_24h PASSED
-tests/test_feed.py::test_includes_friend_who_listened_today PASSED
-tests/test_streaks.py (5 tests) PASSED
-tests/test_search.py (5 tests) PASSED
+Duplicates are **conditional on tag count** — simone's report of "once, twice, or three times" maps to how many tags the matching song has.
 
-12 passed in 1.07s
+#### 3. How you found the root cause
+
+Traced `GET /songs/search?q=Anthem` → `routes/songs.py` → `search_service.search_songs()`. On line 27, noticed an `outerjoin(song_tags, ...)` on the `song_tags` association table. Inspected `Song.to_dict()` in `models.py` and saw tags load via the `Song.tags` relationship (`lazy="subquery"`) — the join was never used. Ran SQL-level inspection: `query.count()` returned 3 for a 3-tag song, confirming one row per tag association.
+
+#### 4. The root cause
+
+`search_songs` included `.outerjoin(song_tags, Song.id == song_tags.c.song_id)` even though tags are loaded separately by `song.to_dict()` → `Song.tags`. SQL joins multiply rows — a song with 3 tag associations produces 3 result rows for the same `song.id`. When those rows are converted via `[song.to_dict() for song in results]`, the same song appears 3 times. Songs with 0 or 1 tag were unaffected because the join produced only 1 row.
+
+#### 5. Your fix and side-effect check
+
+Removed the unnecessary `outerjoin` and unused `Tag` / `song_tags` imports:
+
+```python
+# Before
+db.session.query(Song).outerjoin(song_tags, ...).filter(...).all()
+
+# After
+db.session.query(Song).filter(...).all()
 ```
 
-Note: `tests/test_playlists.py` still fails — that is the separate Issue #5 bug, not yet fixed.
+**Side-effect check:** `pytest tests/test_search.py -v` — all 5 tests pass. `"Crown Heights Anthem"` now returns 1 result with tags `['rap', 'hip-hop', 'boom bap']` still present via `to_dict()`. `get_song()` unchanged.
 
 ---
 
