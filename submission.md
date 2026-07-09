@@ -409,3 +409,18 @@ return [song.to_dict() for song in songs]
 ```
 
 **Side-effect check:** `pytest tests/test_playlists.py -v` — all 3 tests pass (all songs returned, correct order, empty playlist still returns `[]`). Full suite: `pytest tests/ -v` — 15 passed. `create_playlist()` and `get_playlist()` unchanged.
+
+---
+
+## Git Log
+
+Screenshot of `git log --oneline` on the `bugfix/mixtape` branch, showing separate commits for each bug fix:
+
+![git log --oneline on bugfix/mixtape branch](git-log.png)
+
+```
+9042c42 fix(issue #4, #5): bonus fixes for rating notifications and playlist song retrieval
+e79e4a4 fix(issue #3): duplications in song search results
+4a6eae8 fix(issue #2): friends listening now showing people from yesterday
+cd5703b fix(issue #1): listening streak Sunday resets
+```
